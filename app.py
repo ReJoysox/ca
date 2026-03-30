@@ -1,3 +1,30 @@
+import streamlit as st
+from ultralytics import YOLO
+from PIL import Image
+import cv2
+import numpy as np
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+import av
+
+
+st.set_page_config(page_title="SafeGuard LIVE", layout="centered")
+st.title("🛡️ SafeGuard ИИ: Real-Time")
+
+
+@st.cache_resource
+def load_model():
+try:
+return YOLO('best.onnx', task='detect')
+except Exception as e:
+st.error(f"Ошибка загрузки модели: {e}")
+return None
+
+model = load_model()
+
+if model:
+st.sidebar.write("### Обнаружение классов:")
+st.sidebar.write(list(model.names.values()))
+conf_val = st.sidebar.slider("Чувствительность", 0.1, 1.0, 0.4)
 # --- ФУНКЦИЯ ОБРАБОТКИ КАДРА ---
 def process_image_logic(img_cv, model, conf):
     results = model.predict(img_cv, conf=conf, verbose=False)
