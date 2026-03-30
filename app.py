@@ -120,7 +120,7 @@ if model:
         return img_cv, protected_count, unprotected_count
 
     # --- ИНТЕРФЕЙС ---
-    st.info("🎥 *Функция Live-видео заморожена и появится в будущих обновлениях.*")
+    
     st.write("### 📁 Загрузите фото для проверки")
     
     up_img = st.file_uploader("", type=['jpg', 'png', 'jpeg'])
