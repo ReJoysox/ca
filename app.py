@@ -16,7 +16,7 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 
 # -------------------- Streamlit (первый st.*) --------------------
 st.set_page_config(page_title="SafeGuard PRO", layout="centered")
-st.title("🛡️ SafeGuard PRO — контроль каски (зелёный/красный)")
+st.title("🛡️ SafeGuard PRO — контроль каски")
 
 
 ROOT = Path(__file__).parent
@@ -44,13 +44,15 @@ RTC_CONFIGURATION = RTCConfiguration(
 )
 
 
-# -------------------- Thread-safe config for LIVE --------------------
+# -------------------- thread-safe config for LIVE --------------------
 _lock = threading.Lock()
 CFG = {
-    "conf_helmet": 0.25,
     "conf_person": 0.12,
-    "expand_up": 0.80,     # сильнее расширяем person вверх
-    "min_inside": 0.01,    # насколько мало пересечение каски с человеком допускаем
+    "conf_helmet": 0.25,
+    # matching params (можно не трогать)
+    "x_margin": 0.15,      # запас по ширине person (15%)
+    "y_top": 1.30,         # насколько высоко вверх от py1 искать каску (в долях высоты person)
+    "y_bottom": 0.45,      # насколько вниз от py1 разрешаем каску (верхняя часть тела)
 }
 
 
@@ -64,7 +66,18 @@ def cfg_get():
         return dict(CFG)
 
 
-# -------------------- Loaders --------------------
+# -------------------- helpers --------------------
+def indicator_html(ok: bool, text: str):
+    color = "#22c55e" if ok else "#ef4444"
+    return f"""
+    <div style="display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:12px;
+                background: rgba(0,0,0,0.04); border:1px solid rgba(0,0,0,0.08);">
+      <div style="width:16px; height:16px; border-radius:50%; background:{color};"></div>
+      <div style="font-size:16px; font-weight:700;">{text}</div>
+    </div>
+    """
+
+
 @st.cache_resource
 def load_classes():
     if not CLASSES_PATH.exists():
@@ -79,64 +92,44 @@ def load_model():
     return YOLO(str(MODEL_PATH), task="detect")
 
 
-# -------------------- Helpers --------------------
 def label_from_id(cls_id: int, classes: list[str]) -> str:
     if 0 <= cls_id < len(classes):
         return classes[cls_id]
     return f"class{cls_id}"
 
 
-def expand_person_up(p, img_h, ratio):
-    x1, y1, x2, y2 = p
-    h = max(1.0, y2 - y1)
-    y1 = max(0.0, y1 - ratio * h)
-    y2 = min(float(img_h - 1), y2)
-    return [x1, y1, x2, y2]
-
-
-def box_area(b) -> float:
+def box_center(b):
     x1, y1, x2, y2 = b
-    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
 
-def intersect_area(a, b) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    x1 = max(ax1, bx1)
-    y1 = max(ay1, by1)
-    x2 = min(ax2, bx2)
-    y2 = min(ay2, by2)
-    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
-
-
-def inside_ratio(person_box, obj_box) -> float:
-    # доля площади obj (каски) внутри person
-    inter = intersect_area(person_box, obj_box)
-    return inter / (box_area(obj_box) + 1e-9)
-
-
-def helmet_center_in_person(person_box, helmet_box) -> bool:
-    px1, py1, px2, py2 = person_box
-    hx1, hy1, hx2, hy2 = helmet_box
-    cx, cy = (hx1 + hx2) / 2.0, (hy1 + hy2) / 2.0
-    return (px1 <= cx <= px2) and (py1 <= cy <= py2)
-
-
-def indicator_html(ok: bool, text: str):
-    color = "#22c55e" if ok else "#ef4444"
-    return f"""
-    <div style="display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:12px;
-                background: rgba(0,0,0,0.04); border:1px solid rgba(0,0,0,0.08);">
-      <div style="width:16px; height:16px; border-radius:50%; background:{color};"></div>
-      <div style="font-size:16px; font-weight:700;">{text}</div>
-    </div>
+def match_helmet_to_person(person_box, helmet_box, x_margin, y_top, y_bottom) -> bool:
     """
+    person_box: xyxy
+    helmet_box: xyxy
+    Условие: каска должна быть по X в пределах person (с запасом)
+             и по Y в "зоне головы" относительно верхней границы person.
+    """
+    px1, py1, px2, py2 = person_box
+    pw = max(1.0, px2 - px1)
+    ph = max(1.0, py2 - py1)
+
+    hcx, hcy = box_center(helmet_box)
+
+    # расширяем по X
+    x1 = px1 - x_margin * pw
+    x2 = px2 + x_margin * pw
+
+    # зона по Y: от (py1 - y_top*ph) до (py1 + y_bottom*ph)
+    y1 = py1 - y_top * ph
+    y2 = py1 + y_bottom * ph
+
+    return (x1 <= hcx <= x2) and (y1 <= hcy <= y2)
 
 
-# -------------------- Core logic --------------------
-def process_frame(img_bgr, model, classes, conf_helmet, conf_person, expand_up, min_inside):
-    # общий conf минимальный, чтобы person не срезался
-    pred_conf = min(conf_helmet, conf_person, 0.10)
+def process_frame(img_bgr, model, classes, conf_person, conf_helmet, x_margin, y_top, y_bottom):
+    # общий conf минимальный, чтобы не срезать person
+    pred_conf = min(conf_person, conf_helmet, 0.10)
 
     res = model.predict(img_bgr, conf=pred_conf, imgsz=IMGSZ, iou=0.3, verbose=False)[0]
     boxes = res.boxes
@@ -155,31 +148,30 @@ def process_frame(img_bgr, model, classes, conf_helmet, conf_person, expand_up, 
         elif label == "helmet" and score >= conf_helmet:
             helmets.append(xyxy)
 
-    img_h = img_bgr.shape[0]
-
     # рисуем каски зелёным
     for h in helmets:
         x1, y1, x2, y2 = map(int, h)
         cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    # назначаем каски людям (чтобы не “терялись”)
-    has_helmet_for_person = [False] * len(persons)
-
-    expanded_people = [expand_person_up(p, img_h, expand_up) for p in persons]
+    # назначаем каски людям: каска -> лучший (ближайший по X) person среди подходящих
+    has_helmet = [False] * len(persons)
 
     for h in helmets:
-        best_i = -1
-        best_score = 0.0
-        for i, pexp in enumerate(expanded_people):
-            score = inside_ratio(pexp, h)
-            if helmet_center_in_person(pexp, h):
-                score = max(score, 1.0)  # если центр внутри — это почти точно тот человек
-            if score > best_score:
-                best_score = score
-                best_i = i
+        hcx, hcy = box_center(h)
 
-        if best_i != -1 and best_score >= min_inside:
-            has_helmet_for_person[best_i] = True
+        best_i = None
+        best_dx = 1e18
+
+        for i, p in enumerate(persons):
+            if match_helmet_to_person(p, h, x_margin=x_margin, y_top=y_top, y_bottom=y_bottom):
+                pcx, pcy = box_center(p)
+                dx = abs(hcx - pcx)
+                if dx < best_dx:
+                    best_dx = dx
+                    best_i = i
+
+        if best_i is not None:
+            has_helmet[best_i] = True
 
     safe = 0
     danger = 0
@@ -187,14 +179,14 @@ def process_frame(img_bgr, model, classes, conf_helmet, conf_person, expand_up, 
     # рисуем людей зелёный/красный
     for i, p in enumerate(persons):
         x1, y1, x2, y2 = map(int, p)
-        if has_helmet_for_person[i]:
+        if has_helmet[i]:
             safe += 1
             cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 3)
         else:
             danger += 1
             cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 0, 255), 3)
 
-    # общий статус
+    # общий статус (по кадру)
     if len(persons) == 0:
         ok = False
         text = "ЧЕЛОВЕК НЕ ОБНАРУЖЕН"
@@ -211,7 +203,7 @@ def process_frame(img_bgr, model, classes, conf_helmet, conf_person, expand_up, 
     return img_bgr, safe, danger, ok, text
 
 
-# -------------------- Init --------------------
+# -------------------- init --------------------
 try:
     classes = load_classes()
     model = load_model()
@@ -220,14 +212,17 @@ except Exception as e:
     st.stop()
 
 
-# -------------------- Sidebar --------------------
+# -------------------- sidebar --------------------
 st.sidebar.header("Настройки")
-conf_helmet = st.sidebar.slider("Порог каски", 0.05, 1.0, 0.25, 0.05)
-conf_person = st.sidebar.slider("Порог человека", 0.01, 1.0, 0.12, 0.01)
-expand_up = st.sidebar.slider("Расширение person вверх", 0.20, 1.50, 0.80, 0.05)
-min_inside = st.sidebar.slider("Привязка каски к человеку", 0.001, 0.10, 0.01, 0.001)
+conf_person = st.sidebar.slider("Порог человека (person)", 0.01, 1.0, 0.12, 0.01)
+conf_helmet = st.sidebar.slider("Порог каски (helmet)", 0.05, 1.0, 0.25, 0.05)
 
-cfg_set(conf_helmet=conf_helmet, conf_person=conf_person, expand_up=expand_up, min_inside=min_inside)
+# matching (можно не трогать)
+x_margin = st.sidebar.slider("Запас по ширине (X)", 0.0, 0.6, 0.15, 0.05)
+y_top = st.sidebar.slider("Зона вверх (Y)", 0.3, 2.5, 1.30, 0.10)
+y_bottom = st.sidebar.slider("Зона вниз (Y)", 0.1, 1.2, 0.45, 0.05)
+
+cfg_set(conf_person=conf_person, conf_helmet=conf_helmet, x_margin=x_margin, y_top=y_top, y_bottom=y_bottom)
 
 st.sidebar.write("---")
 st.sidebar.write("classes.txt:")
@@ -245,9 +240,14 @@ class VideoProcessor(VideoProcessorBase):
         cfg = cfg_get()
 
         out, safe, danger, ok, text = process_frame(
-            img, model, classes,
-            cfg["conf_helmet"], cfg["conf_person"],
-            cfg["expand_up"], cfg["min_inside"]
+            img,
+            model,
+            classes,
+            cfg["conf_person"],
+            cfg["conf_helmet"],
+            cfg["x_margin"],
+            cfg["y_top"],
+            cfg["y_bottom"],
         )
 
         with self._l:
@@ -256,7 +256,7 @@ class VideoProcessor(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
 
-# -------------------- Tabs --------------------
+# -------------------- tabs --------------------
 tab1, tab2 = st.tabs(["🎥 LIVE ВИДЕО", "📁 АНАЛИЗ ФОТО"])
 
 with tab1:
@@ -281,7 +281,7 @@ with tab2:
     if up_img:
         img_bgr = cv2.cvtColor(np.array(Image.open(up_img).convert("RGB")), cv2.COLOR_RGB2BGR)
         out, safe, danger, ok, text = process_frame(
-            img_bgr, model, classes, conf_helmet, conf_person, expand_up, min_inside
+            img_bgr, model, classes, conf_person, conf_helmet, x_margin, y_top, y_bottom
         )
         st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_container_width=True)
         st.markdown(indicator_html(ok, text), unsafe_allow_html=True)
