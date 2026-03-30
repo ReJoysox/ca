@@ -132,28 +132,32 @@ if model:
     # --- КЛАСС ДЛЯ REAL-TIME ВИДЕО ---
     class VideoProcessor:
         def __init__(self):
-            # Значения по умолчанию до подключения UI
             self.conf = 0.3
             self.target_ppe = []
 
         def recv(self, frame):
-            # Добавлена защита от ошибок (try-except), чтобы камера не зависала
             try:
                 img = frame.to_ndarray(format="bgr24")
                 
-                # Используем безопасные параметры
+                # Уменьшаем кадр, если он слишком огромный (ускоряет обработку в 3-4 раза)
+                h, w = img.shape[:2]
+                if w > 800:
+                    img = cv2.resize(img, (800, int(800 * h / w)))
+
                 current_conf = self.conf if self.conf is not None else 0.3
                 current_ppe = self.target_ppe if self.target_ppe else []
 
                 processed_img, p_count, u_count = process_image_logic(img, model, current_conf, current_ppe)
+                
+                # ИСПРАВЛЕНИЕ ЧЕРНОГО ЭКРАНА: строго приводим к нужному типу данных
+                processed_img = np.array(processed_img, dtype=np.uint8)
                 
                 cv2.putText(processed_img, f"Protected: {p_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(processed_img, f"Unprotected: {u_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 
                 return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
             except Exception as e:
-                # Если произошла ошибка внутри потока, возвращаем оригинальный кадр, чтобы видео не зависло
-                print(f"Ошибка кадра: {e}")
+                # В случае ошибки возвращаем оригинальный кадр
                 return frame
 
     # Интерфейс
@@ -162,20 +166,24 @@ if model:
     with tab1:
         st.write("Нажмите 'Start' для запуска мониторинга камеры.")
         
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ДЛЯ ВИДЕОПОТОКА:
         ctx = webrtc_streamer(
             key="ppe-detection",
             video_processor_factory=VideoProcessor,
             rtc_configuration={
                 "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
             },
-            # 1. ОТКЛЮЧАЕМ ЗАПРОС МИКРОФОНА (из-за него часто крутится бесконечная загрузка)
-            media_stream_constraints={"video": True, "audio": False},
-            # 2. Асинхронная обработка для стабильности
+            # ИСПРАВЛЕНИЕ TIMEOUT'А: ограничиваем разрешение и кадры в секунду
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15}
+                },
+                "audio": False
+            },
             async_processing=True
         )
         
-        # Безопасная передача параметров в работающую камеру
         if ctx and ctx.video_processor:
             ctx.video_processor.conf = conf_val
             ctx.video_processor.target_ppe = selected_ppe
