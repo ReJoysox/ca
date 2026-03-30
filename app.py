@@ -8,39 +8,19 @@ import numpy as np
 import onnxruntime as ort
 import streamlit as st
 from PIL import Image
-import av
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
 
-# -------------------- Streamlit --------------------
 st.set_page_config(page_title="SafeGuard PRO", layout="centered")
-st.title("SafeGuard PRO — контроль СИЗ")
+
+st.title("🛡 SafeGuard PRO")
+st.write("ИИ контроль каски и жилета")
 
 ROOT = Path(__file__).parent
 MODEL_PATH = ROOT / "best.onnx"
 CLASSES_PATH = ROOT / "classes.txt"
 
 
-# -------------------- TURN для Streamlit Cloud --------------------
-RTC_CONFIGURATION = RTCConfiguration(
-    {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {
-                "urls": [
-                    "turn:openrelay.metered.ca:80?transport=tcp",
-                    "turn:openrelay.metered.ca:443?transport=tcp",
-                    "turns:openrelay.metered.ca:443?transport=tcp",
-                ],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-        ]
-    }
-)
-
-
-# -------------------- Загрузка --------------------
+# ------------------ загрузка ------------------
 @st.cache_resource
 def load_classes():
     return [x.strip() for x in CLASSES_PATH.read_text().splitlines()]
@@ -57,29 +37,8 @@ classes = load_classes()
 sess, input_name = load_model()
 
 
-# -------------------- Проверки классов --------------------
-def is_person(label):
-    return label == "person"
-
-
-def is_helmet(label):
-    return label == "helmet"
-
-
-def is_vest(label):
-    return label == "vest"
-
-
-def is_no_helmet(label):
-    return label == "no-helmet"
-
-
-def is_no_vest(label):
-    return label == "no-vest"
-
-
-# -------------------- Инференс --------------------
-def process_frame(img):
+# ------------------ логика ------------------
+def infer(img):
     h0, w0 = img.shape[:2]
 
     x = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -99,7 +58,7 @@ def process_frame(img):
     for det in out:
         x1, y1, x2, y2, score, cls_id = det
 
-        if score < 0.25:
+        if score < 0.30:  # ↑ подняли порог для точности
             continue
 
         label = classes[int(cls_id)]
@@ -109,16 +68,16 @@ def process_frame(img):
         y1 = int(y1 * h0 / 640)
         y2 = int(y2 * h0 / 640)
 
-        if is_person(label):
+        if label == "person":
             people.append([x1, y1, x2, y2])
 
-        elif is_helmet(label):
+        elif label == "helmet":
             helmets.append([x1, y1, x2, y2])
 
-        elif is_vest(label):
+        elif label == "vest":
             vests.append([x1, y1, x2, y2])
 
-        elif is_no_helmet(label) or is_no_vest(label):
+        elif label == "no-helmet" or label == "no-vest":
             no_boxes.append([x1, y1, x2, y2])
 
     safe = 0
@@ -127,63 +86,74 @@ def process_frame(img):
     for p in people:
         px1, py1, px2, py2 = p
 
-        has_ppe = False
+        has_helmet = False
+        has_vest = False
         has_no = False
 
-        # Проверяем helmet/vest внутри человека
+        # проверка каски
         for h in helmets:
             cx = (h[0] + h[2]) / 2
             cy = (h[1] + h[3]) / 2
             if px1 < cx < px2 and py1 < cy < py2:
-                has_ppe = True
+                has_helmet = True
 
+        # проверка жилета
         for v in vests:
             cx = (v[0] + v[2]) / 2
             cy = (v[1] + v[3]) / 2
             if px1 < cx < px2 and py1 < cy < py2:
-                has_ppe = True
+                has_vest = True
 
+        # прямое нарушение
         for nb in no_boxes:
             if not (nb[2] < px1 or nb[0] > px2 or nb[3] < py1 or nb[1] > py2):
                 has_no = True
 
         if has_no:
-            cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 255), 3)
             danger += 1
+            cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 255), 3)
+
+        elif has_helmet or has_vest:
+            safe += 1
+            cv2.rectangle(img, (px1, py1), (px2, py2), (0, 255, 0), 3)
+
         else:
-            if has_ppe:
-                cv2.rectangle(img, (px1, py1), (px2, py2), (0, 255, 0), 3)
-                safe += 1
-            else:
-                cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 255), 3)
-                danger += 1
+            danger += 1
+            cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 255), 3)
 
     return img, safe, danger
 
 
-# -------------------- LIVE --------------------
-class VideoProcessor(VideoProcessorBase):
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        processed, _, _ = process_frame(img)
-        return av.VideoFrame.from_ndarray(processed, format="bgr24")
+# ------------------ интерфейс ------------------
+uploaded = st.file_uploader("Загрузите фото", type=["jpg", "jpeg", "png"])
 
+if uploaded:
+    img = cv2.cvtColor(np.array(Image.open(uploaded).convert("RGB")), cv2.COLOR_RGB2BGR)
 
-tab1, tab2 = st.tabs(["LIVE", "Фото"])
+    result, safe, danger = infer(img)
 
-with tab1:
-    webrtc_streamer(
-        key="live",
-        video_processor_factory=VideoProcessor,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
+    st.image(cv2.cvtColor(result, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-with tab2:
-    uploaded = st.file_uploader("Загрузите фото", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        img = cv2.cvtColor(np.array(Image.open(uploaded).convert("RGB")), cv2.COLOR_RGB2BGR)
-        result, safe, danger = process_frame(img)
-        st.image(cv2.cvtColor(result, cv2.COLOR_BGR2RGB), use_container_width=True)
-        st.write(f"SAFE: {safe} | DANGER: {danger}")
+    # ✅ Индикатор
+    if danger == 0 and safe > 0:
+        st.markdown(
+            """
+            <div style="text-align:center; padding:20px;">
+                <div style="width:60px;height:60px;background:#00cc44;border-radius:50%;margin:auto;"></div>
+                <h3 style="color:#00cc44;">СИЗ ОБНАРУЖЕНЫ</h3>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            """
+            <div style="text-align:center; padding:20px;">
+                <div style="width:60px;height:60px;background:#ff0000;border-radius:50%;margin:auto;"></div>
+                <h3 style="color:#ff0000;">НЕТ СИЗ</h3>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    st.write(f"SAFE: {safe} | DANGER: {danger}")
