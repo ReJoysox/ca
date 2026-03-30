@@ -1,33 +1,27 @@
 import os
-# Важно: до импортов ultralytics/onnxruntime
 os.environ["ORT_SKIP_OPSET_VALIDATION"] = "1"
 os.environ["ORT_LOGGING_LEVEL"] = "3"
 
-import threading
 from pathlib import Path
-
-import av
 import cv2
 import numpy as np
+import onnxruntime as ort
 import streamlit as st
 from PIL import Image
-from ultralytics import YOLO
+import av
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
 
-# -------------------- Streamlit (первый st.*) --------------------
+# -------------------- Streamlit --------------------
 st.set_page_config(page_title="SafeGuard PRO", layout="centered")
-st.title("🛡️ SafeGuard PRO — контроль каски (зелёный/красный)")
-
+st.title("SafeGuard PRO — контроль СИЗ")
 
 ROOT = Path(__file__).parent
 MODEL_PATH = ROOT / "best.onnx"
 CLASSES_PATH = ROOT / "classes.txt"
 
-IMGSZ = 640
 
-
-# -------------------- WebRTC (TURN чтобы работало на Streamlit Cloud) --------------------
+# -------------------- TURN для Streamlit Cloud --------------------
 RTC_CONFIGURATION = RTCConfiguration(
     {
         "iceServers": [
@@ -46,159 +40,150 @@ RTC_CONFIGURATION = RTCConfiguration(
 )
 
 
-# -------------------- Shared config for video thread --------------------
-_lock = threading.Lock()
-CFG = {"conf": 0.25, "person_conf": 0.12}  # общий порог и порог person отдельно
-
-
-def cfg_set(**kwargs):
-    with _lock:
-        CFG.update(kwargs)
-
-
-def cfg_get():
-    with _lock:
-        return dict(CFG)
-
-
+# -------------------- Загрузка --------------------
 @st.cache_resource
 def load_classes():
-    if not CLASSES_PATH.exists():
-        raise FileNotFoundError(f"Не найден classes.txt: {CLASSES_PATH}")
-    return [x.strip() for x in CLASSES_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
+    return [x.strip() for x in CLASSES_PATH.read_text().splitlines()]
 
 
 @st.cache_resource
 def load_model():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Не найден best.onnx: {MODEL_PATH}")
-
-    model = YOLO(str(MODEL_PATH), task="detect")
-
-    # Жёстко фиксируем имена классов по твоему classes.txt (чтобы ничего не путалось)
-    names = load_classes()  # ["person","helmet","vest","no-helmet","no-vest"]
-    model.names = {i: n for i, n in enumerate(names)}
-
-    return model
+    sess = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    return sess, input_name
 
 
-def expand_person_up(p, img_h, ratio=0.65):
-    """Person bbox часто обрезает голову -> расширяем вверх, чтобы каска попадала внутрь."""
-    x1, y1, x2, y2 = p
-    h = max(1.0, y2 - y1)
-    y1 = max(0.0, y1 - ratio * h)
-    y2 = min(float(img_h - 1), y2)
-    return [x1, y1, x2, y2]
+classes = load_classes()
+sess, input_name = load_model()
 
 
-def inside_ratio(person_box, obj_box) -> float:
-    """Доля площади объекта (каски) внутри бокса человека."""
-    px1, py1, px2, py2 = person_box
-    ox1, oy1, ox2, oy2 = obj_box
-
-    ix1 = max(px1, ox1)
-    iy1 = max(py1, oy1)
-    ix2 = min(px2, ox2)
-    iy2 = min(py2, oy2)
-
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    obj_area = max(0.0, ox2 - ox1) * max(0.0, oy2 - oy1) + 1e-9
-    return inter / obj_area
+# -------------------- Проверки классов --------------------
+def is_person(label):
+    return label == "person"
 
 
-def process_frame_helmet_only(img_bgr, model, conf, person_conf):
-    # Чтобы person не отрезало, в predict ставим минимальный порог
-    pred_conf = min(conf, person_conf, 0.10)
+def is_helmet(label):
+    return label == "helmet"
 
-    res = model.predict(img_bgr, conf=pred_conf, imgsz=IMGSZ, iou=0.3, verbose=False)[0]
-    boxes = res.boxes
 
-    people = []      # list of xyxy
-    helmets = []     # list of xyxy
-    no_helmets = []  # list of xyxy (если модель даёт)
+def is_vest(label):
+    return label == "vest"
 
-    for b in boxes:
-        cls_id = int(b.cls[0])
-        label = model.names.get(cls_id, str(cls_id))
-        score = float(b.conf[0])
-        xyxy = b.xyxy[0].tolist()
 
-        if label == "person" and score >= person_conf:
-            people.append(xyxy)
-        elif label == "helmet" and score >= conf:
-            helmets.append(xyxy)
-        elif label == "no-helmet" and score >= conf:
-            no_helmets.append(xyxy)
+def is_no_helmet(label):
+    return label == "no-helmet"
+
+
+def is_no_vest(label):
+    return label == "no-vest"
+
+
+# -------------------- Инференс --------------------
+def process_frame(img):
+    h0, w0 = img.shape[:2]
+
+    x = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    x = cv2.resize(x, (640, 640))
+    x = np.transpose(x, (2, 0, 1))[None, ...]
+
+    out = sess.run(None, {input_name: x})[0]
+
+    if out.ndim == 3:
+        out = out[0]
+
+    people = []
+    helmets = []
+    vests = []
+    no_boxes = []
+
+    for det in out:
+        x1, y1, x2, y2, score, cls_id = det
+
+        if score < 0.25:
+            continue
+
+        label = classes[int(cls_id)]
+
+        x1 = int(x1 * w0 / 640)
+        x2 = int(x2 * w0 / 640)
+        y1 = int(y1 * h0 / 640)
+        y2 = int(y2 * h0 / 640)
+
+        if is_person(label):
+            people.append([x1, y1, x2, y2])
+
+        elif is_helmet(label):
+            helmets.append([x1, y1, x2, y2])
+
+        elif is_vest(label):
+            vests.append([x1, y1, x2, y2])
+
+        elif is_no_helmet(label) or is_no_vest(label):
+            no_boxes.append([x1, y1, x2, y2])
 
     safe = 0
     danger = 0
-    img_h = img_bgr.shape[0]
-
-    # Порог привязки каски к человеку (мягкий)
-    HELMET_INSIDE = 0.03
 
     for p in people:
         px1, py1, px2, py2 = p
-        p_exp = expand_person_up(p, img_h, ratio=0.65)
 
-        # Каска считается "на человеке", если хоть немного её площади внутри расширенного person
-        has_helmet = any(inside_ratio(p_exp, h) >= HELMET_INSIDE for h in helmets)
+        has_ppe = False
+        has_no = False
 
-        # если каска есть -> SAFE (зелёный), иначе -> DANGER (красный)
-        if has_helmet:
-            safe += 1
-            cv2.rectangle(img_bgr, (int(px1), int(py1)), (int(px2), int(py2)), (0, 255, 0), 3)
-        else:
+        # Проверяем helmet/vest внутри человека
+        for h in helmets:
+            cx = (h[0] + h[2]) / 2
+            cy = (h[1] + h[3]) / 2
+            if px1 < cx < px2 and py1 < cy < py2:
+                has_ppe = True
+
+        for v in vests:
+            cx = (v[0] + v[2]) / 2
+            cy = (v[1] + v[3]) / 2
+            if px1 < cx < px2 and py1 < cy < py2:
+                has_ppe = True
+
+        for nb in no_boxes:
+            if not (nb[2] < px1 or nb[0] > px2 or nb[3] < py1 or nb[1] > py2):
+                has_no = True
+
+        if has_no:
+            cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 255), 3)
             danger += 1
-            cv2.rectangle(img_bgr, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 3)
+        else:
+            if has_ppe:
+                cv2.rectangle(img, (px1, py1), (px2, py2), (0, 255, 0), 3)
+                safe += 1
+            else:
+                cv2.rectangle(img, (px1, py1), (px2, py2), (0, 0, 255), 3)
+                danger += 1
 
-    return img_bgr, safe, danger
-
-
-# -------------------- Init --------------------
-try:
-    model = load_model()
-except Exception as e:
-    st.error(f"Ошибка загрузки модели: {e}")
-    st.stop()
-
-
-# -------------------- Sidebar --------------------
-st.sidebar.header("Настройки")
-conf = st.sidebar.slider("Порог каски (helmet)", 0.05, 1.0, 0.25, 0.05)
-person_conf = st.sidebar.slider("Порог человека (person)", 0.01, 1.0, 0.12, 0.01)
-cfg_set(conf=conf, person_conf=person_conf)
-
-st.sidebar.write("---")
-st.sidebar.write("Классы модели:")
-st.sidebar.code("\n".join([f"{i}: {n}" for i, n in model.names.items()]))
+    return img, safe, danger
 
 
 # -------------------- LIVE --------------------
 class VideoProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        cfg = cfg_get()
-        out, _, _ = process_frame_helmet_only(img, model, cfg["conf"], cfg["person_conf"])
-        return av.VideoFrame.from_ndarray(out, format="bgr24")
+        processed, _, _ = process_frame(img)
+        return av.VideoFrame.from_ndarray(processed, format="bgr24")
 
 
-tab1, tab2 = st.tabs(["🎥 LIVE ВИДЕО", "📁 АНАЛИЗ ФОТО"])
+tab1, tab2 = st.tabs(["LIVE", "Фото"])
 
 with tab1:
-    st.write("SAFE/DANGER считаются по каске: есть каска = зелёный, нет = красный.")
     webrtc_streamer(
-        key="ppe-live",
+        key="live",
         video_processor_factory=VideoProcessor,
         rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": {"width": 640, "height": 480, "frameRate": 12}, "audio": False},
+        media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
 
 with tab2:
-    up_img = st.file_uploader("Загрузите фото", type=["jpg", "jpeg", "png"])
-    if up_img:
-        img_bgr = cv2.cvtColor(np.array(Image.open(up_img).convert("RGB")), cv2.COLOR_RGB2BGR)
-        out, safe, danger = process_frame_helmet_only(img_bgr, model, conf, person_conf)
-        st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_container_width=True)
-        st.write(f"### SAFE (в каске): {safe} | DANGER (без каски): {danger}")
+    uploaded = st.file_uploader("Загрузите фото", type=["jpg", "jpeg", "png"])
+    if uploaded:
+        img = cv2.cvtColor(np.array(Image.open(uploaded).convert("RGB")), cv2.COLOR_RGB2BGR)
+        result, safe, danger = process_frame(img)
+        st.image(cv2.cvtColor(result, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.write(f"SAFE: {safe} | DANGER: {danger}")
