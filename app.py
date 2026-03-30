@@ -51,7 +51,6 @@ def is_ppe_on_person(person_box, ppe_box):
     intersection_area = (x_right - x_left) * (y_bottom - y_top)
     ppe_area = (ppe_box[2] - ppe_box[0]) * (ppe_box[3] - ppe_box[1])
     
-    # Если предмет защиты (каска) минимум на 50% внутри контура человека - значит он надет
     if ppe_area > 0 and (intersection_area / ppe_area) > 0.5:
         return True
     return False
@@ -62,7 +61,6 @@ if model:
     ppe_classes = [c for c in all_classes if c not in person_classes]
 
     st.sidebar.write("### Настройки детекции")
-    # Понизил порог по умолчанию до 0.3, чтобы ИИ реже терял людей из виду
     conf_val = st.sidebar.slider("Чувствительность модели", 0.1, 1.0, 0.3)
     
     selected_ppe = st.sidebar.multiselect(
@@ -86,7 +84,6 @@ if model:
         raw_people = []
         protection_boxes = []
 
-        # 1. Собираем все найденные объекты
         for box in boxes:
             cls_id = int(box.cls[0])
             label = model.names[cls_id].lower()
@@ -97,30 +94,26 @@ if model:
                 raw_people.append({"coords": coords, "conf": confidence})
             elif label in target_ppe:
                 protection_boxes.append(coords)
-                # Рисуем рамки СИЗ (голубые)
                 cv2.rectangle(img_cv, (int(coords[0]), int(coords[1])), (int(coords[2]), int(coords[3])), (255, 255, 0), 2)
                 cv2.putText(img_cv, label.upper(), (int(coords[0]), int(coords[1]-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
-        # 2. Фильтруем людей от дубликатов (NMS)
-        raw_people.sort(key=lambda x: x['conf'], reverse=True) # Сначала самые уверенные
+        raw_people.sort(key=lambda x: x['conf'], reverse=True)
         filtered_people = []
         
         for person in raw_people:
             is_duplicate = False
             for fp in filtered_people:
-                if compute_iou(person["coords"], fp["coords"]) > 0.4: # Если рамки пересекаются на 40%
+                if compute_iou(person["coords"], fp["coords"]) > 0.4:
                     is_duplicate = True
                     break
             if not is_duplicate:
                 filtered_people.append(person)
 
-        # 3. Проверка защиты для каждого уникального человека
         for p in filtered_people:
             px1, py1, px2, py2 = p["coords"]
             is_protected = False
             
             for prot_coords in protection_boxes:
-                # Проверяем, надето ли СИЗ именно на этого человека
                 if is_ppe_on_person(p["coords"], prot_coords):
                     is_protected = True
                     break
@@ -139,18 +132,29 @@ if model:
     # --- КЛАСС ДЛЯ REAL-TIME ВИДЕО ---
     class VideoProcessor:
         def __init__(self):
+            # Значения по умолчанию до подключения UI
             self.conf = 0.3
             self.target_ppe = []
 
         def recv(self, frame):
-            img = frame.to_ndarray(format="bgr24")
-            processed_img, p_count, u_count = process_image_logic(img, model, self.conf, self.target_ppe)
-            
-            # Статистика в углу видео
-            cv2.putText(processed_img, f"Protected: {p_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(processed_img, f"Unprotected: {u_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            
-            return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+            # Добавлена защита от ошибок (try-except), чтобы камера не зависала
+            try:
+                img = frame.to_ndarray(format="bgr24")
+                
+                # Используем безопасные параметры
+                current_conf = self.conf if self.conf is not None else 0.3
+                current_ppe = self.target_ppe if self.target_ppe else []
+
+                processed_img, p_count, u_count = process_image_logic(img, model, current_conf, current_ppe)
+                
+                cv2.putText(processed_img, f"Protected: {p_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(processed_img, f"Unprotected: {u_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                
+                return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+            except Exception as e:
+                # Если произошла ошибка внутри потока, возвращаем оригинальный кадр, чтобы видео не зависло
+                print(f"Ошибка кадра: {e}")
+                return frame
 
     # Интерфейс
     tab1, tab2 = st.tabs(["🎥 Живое видео", "📁 Загрузить фото"])
@@ -158,15 +162,21 @@ if model:
     with tab1:
         st.write("Нажмите 'Start' для запуска мониторинга камеры.")
         
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ДЛЯ ВИДЕОПОТОКА:
         ctx = webrtc_streamer(
             key="ppe-detection",
             video_processor_factory=VideoProcessor,
             rtc_configuration={
                 "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-            }
+            },
+            # 1. ОТКЛЮЧАЕМ ЗАПРОС МИКРОФОНА (из-за него часто крутится бесконечная загрузка)
+            media_stream_constraints={"video": True, "audio": False},
+            # 2. Асинхронная обработка для стабильности
+            async_processing=True
         )
         
-        if ctx.video_processor:
+        # Безопасная передача параметров в работающую камеру
+        if ctx and ctx.video_processor:
             ctx.video_processor.conf = conf_val
             ctx.video_processor.target_ppe = selected_ppe
 
