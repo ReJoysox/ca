@@ -143,3 +143,119 @@ def process_frame(img_bgr, model, classes, conf_helmet, conf_person, helmet_insi
             persons.append(xyxy)
         elif label == "helmet" and score >= conf_helmet:
             helmets.append(xyxy)
+
+    safe = 0
+    danger = 0
+    img_h = img_bgr.shape[0]
+
+    # каски рисуем зелёным
+    for h in helmets:
+        x1, y1, x2, y2 = map(int, h)
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    for p in persons:
+        px1, py1, px2, py2 = p
+        p_exp = expand_person_up(p, img_h, person_expand_up)
+
+        has_helmet = any(inside_ratio(p_exp, h) >= helmet_inside_ratio for h in helmets)
+
+        if has_helmet:
+            safe += 1
+            cv2.rectangle(img_bgr, (int(px1), int(py1)), (int(px2), int(py2)), (0, 255, 0), 3)
+        else:
+            danger += 1
+            cv2.rectangle(img_bgr, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 3)
+
+    if len(persons) == 0:
+        status_ok = False
+        status_text = "ЧЕЛОВЕК НЕ ОБНАРУЖЕН"
+    else:
+        status_ok = (danger == 0 and safe > 0)
+        status_text = "ЕСТЬ СИЗ" if status_ok else "НЕТ СИЗ"
+
+    return img_bgr, safe, danger, status_ok, status_text
+
+
+# ================= UI =================
+st.title("🛡️ SafeGuard PRO")
+
+try:
+    classes = load_classes()
+    model = load_model()
+except Exception as e:
+    st.error(f"Ошибка загрузки модели: {e}")
+    st.stop()
+
+st.sidebar.header("Настройки")
+conf_helmet = st.sidebar.slider("Порог каски (helmet)", 0.05, 1.0, 0.25, 0.05)
+conf_person = st.sidebar.slider("Порог человека (person)", 0.01, 1.0, 0.12, 0.01)
+helmet_inside_ratio = st.sidebar.slider("Привязка каски к человеку", 0.01, 0.30, 0.03, 0.01)
+person_expand_up = st.sidebar.slider("Расширение person вверх", 0.10, 1.20, 0.65, 0.05)
+
+cfg_set(
+    conf_helmet=conf_helmet,
+    conf_person=conf_person,
+    helmet_inside_ratio=helmet_inside_ratio,
+    person_expand_up=person_expand_up,
+)
+
+st.sidebar.write("---")
+st.sidebar.write("classes.txt:")
+st.sidebar.code("\n".join([f"{i}: {n}" for i, n in enumerate(classes)]))
+
+tab1, tab2 = st.tabs(["🎥 LIVE ВИДЕО", "📁 АНАЛИЗ ФОТО"])
+
+
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.last = {"safe": 0, "danger": 0, "ok": False, "text": "—"}
+        self._l = threading.Lock()
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        cfg = cfg_get()
+
+        out, safe, danger, ok, text = process_frame(
+            img,
+            model,
+            classes,
+            cfg["conf_helmet"],
+            cfg["conf_person"],
+            cfg["helmet_inside_ratio"],
+            cfg["person_expand_up"],
+        )
+
+        with self._l:
+            self.last = {"safe": safe, "danger": danger, "ok": ok, "text": text}
+
+        return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+
+with tab1:
+    ctx = webrtc_streamer(
+        key="ppe-live",
+        video_processor_factory=VideoProcessor,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": {"width": 640, "height": 480, "frameRate": 12}, "audio": False},
+        async_processing=True,
+    )
+
+    if ctx.video_processor:
+        with ctx.video_processor._l:
+            info = dict(ctx.video_processor.last)
+        st.markdown(indicator_html(info["ok"], info["text"]), unsafe_allow_html=True)
+        st.write(f"SAFE: {info['safe']} | DANGER: {info['danger']}")
+    else:
+        st.markdown(indicator_html(False, "LIVE не запущен"), unsafe_allow_html=True)
+
+
+with tab2:
+    up_img = st.file_uploader("Загрузите фото", type=["jpg", "jpeg", "png"])
+    if up_img:
+        img_bgr = cv2.cvtColor(np.array(Image.open(up_img).convert("RGB")), cv2.COLOR_RGB2BGR)
+        out, safe, danger, ok, text = process_frame(
+            img_bgr, model, classes, conf_helmet, conf_person, helmet_inside_ratio, person_expand_up
+        )
+        st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.markdown(indicator_html(ok, text), unsafe_allow_html=True)
+        st.write(f"SAFE: {safe} | DANGER: {danger}")
