@@ -31,8 +31,12 @@ if model:
         results = model.predict(img_cv, conf=conf, verbose=False)
         boxes = results[0].boxes
         
+        # Счетчики
+        protected_count = 0
+        unprotected_count = 0
+        
         if len(boxes) == 0:
-            return img_cv
+            return img_cv, protected_count, unprotected_count
 
         people = []
         protection_boxes = []
@@ -45,35 +49,48 @@ if model:
             if 'person' in label or 'human' in label:
                 people.append(coords)
             else:
-                protection_boxes.append(coords)
-                cv2.rectangle(img_cv, (int(coords[0]), int(coords[1])), (int(coords[2]), int(coords[3])), (0, 255, 0), 2)
-                cv2.putText(img_cv, label.upper(), (int(coords[0]), int(coords[1]-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                protection_boxes.append((coords, label))
+                # Рисуем рамки для самих СИЗ (каски, жилеты и т.д.)
+                cv2.rectangle(img_cv, (int(coords[0]), int(coords[1])), (int(coords[2]), int(coords[3])), (255, 255, 0), 2)
+                cv2.putText(img_cv, label.upper(), (int(coords[0]), int(coords[1]-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         for p in people:
             px1, py1, px2, py2 = p
             is_protected = False
-            for prot in protection_boxes:
-                rx1, ry1, rx2, ry2 = prot
+            
+            # Проверка пересечения человека и СИЗ
+            for prot_coords, prot_label in protection_boxes:
+                rx1, ry1, rx2, ry2 = prot_coords
                 if not (rx2 < px1 or rx1 > px2 or ry2 < py1 or ry1 > py2):
                     is_protected = True
                     break
             
             if is_protected:
-                cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (255, 255, 255), 1)
+                protected_count += 1
+                # Зеленая рамка для человека в СИЗ
+                cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 255, 0), 2)
+                cv2.putText(img_cv, "PROTECTED", (int(px1), int(py1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
+                unprotected_count += 1
+                # Красная рамка для человека без СИЗ
                 cv2.putText(img_cv, "NO PROTECTION", (int(px1), int(py1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 head_h = int((py2 - py1) * 0.25)
-                cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py1 + head_h)), (0, 0, 255), 3)
-                cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 1)
+                cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py1 + head_h)), (0, 0, 255), 3) # Акцент на голову
+                cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 1) # Общая рамка
         
-        return img_cv
+        return img_cv, protected_count, unprotected_count
 
     # --- КЛАСС ДЛЯ REAL-TIME ВИДЕО ---
     class VideoProcessor:
         def recv(self, frame):
             img = frame.to_ndarray(format="bgr24")
             # Обрабатываем кадр
-            processed_img = process_image_logic(img, model, conf_val)
+            processed_img, p_count, u_count = process_image_logic(img, model, conf_val)
+            
+            # Добавляем счетчики прямо на видео для Live-режима
+            cv2.putText(processed_img, f"Protected: {p_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(processed_img, f"Unprotected: {u_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
             return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
 
     # Интерфейс
@@ -94,8 +111,22 @@ if model:
         if up_img:
             img = Image.open(up_img)
             img_cv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-            res_cv = process_image_logic(img_cv, model, conf_val)
-            st.image(cv2.cvtColor(res_cv, cv2.COLOR_BGR2RGB), width=500)
+            
+            # Получаем изображение и счетчики
+            res_cv, p_count, u_count = process_image_logic(img_cv, model, conf_val)
+            
+            # Выводим обработанное изображение
+            st.image(cv2.cvtColor(res_cv, cv2.COLOR_BGR2RGB), use_column_width=True)
+            
+            # Выводим статистику под фото
+            st.markdown("---")
+            st.markdown("<h3 style='text-align: center;'>Статистика распознавания:</h3>", unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"### 🟢 В СИЗ (Есть защита): **{p_count}**")
+            with col2:
+                st.markdown(f"### 🔴 Без СИЗ (Нет защиты): **{u_count}**")
 
 else:
     st.error("Ошибка загрузки модели.")
