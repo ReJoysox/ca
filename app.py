@@ -21,23 +21,55 @@ def load_model():
 
 model = load_model()
 
-if model:
-    # Получаем все классы из модели и приводим к нижнему регистру
-    all_classes = [name.lower() for name in model.names.values()]
+# Вспомогательная функция: Пересечение рамок (IoU) для удаления дублей
+def compute_iou(box1, box2):
+    x_left = max(box1[0], box2[0])
+    y_top = max(box1[1], box2[1])
+    x_right = min(box1[2], box2[2])
+    y_bottom = min(box1[3], box2[3])
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
     
-    # Отделяем класс человека от классов СИЗ
+    iou = intersection_area / float(box1_area + box2_area - intersection_area)
+    return iou
+
+# Вспомогательная функция: Проверка, находится ли СИЗ на человеке
+def is_ppe_on_person(person_box, ppe_box):
+    x_left = max(person_box[0], ppe_box[0])
+    y_top = max(person_box[1], ppe_box[1])
+    x_right = min(person_box[2], ppe_box[2])
+    y_bottom = min(person_box[3], ppe_box[3])
+
+    if x_right < x_left or y_bottom < y_top:
+        return False
+
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    ppe_area = (ppe_box[2] - ppe_box[0]) * (ppe_box[3] - ppe_box[1])
+    
+    # Если предмет защиты (каска) минимум на 50% внутри контура человека - значит он надет
+    if ppe_area > 0 and (intersection_area / ppe_area) > 0.5:
+        return True
+    return False
+
+if model:
+    all_classes = [name.lower() for name in model.names.values()]
     person_classes = [c for c in all_classes if 'person' in c or 'human' in c]
     ppe_classes = [c for c in all_classes if c not in person_classes]
 
     st.sidebar.write("### Настройки детекции")
-    conf_val = st.sidebar.slider("Чувствительность модели", 0.1, 1.0, 0.4)
+    # Понизил порог по умолчанию до 0.3, чтобы ИИ реже терял людей из виду
+    conf_val = st.sidebar.slider("Чувствительность модели", 0.1, 1.0, 0.3)
     
-    # Поле выбора конкретных СИЗ для контроля
     selected_ppe = st.sidebar.multiselect(
-        "Выберите классы СИЗ для проверки защиты (например, только каски):",
+        "Выберите СИЗ для контроля:",
         options=ppe_classes,
-        default=ppe_classes, # По умолчанию выбраны все доступные СИЗ
-        help="Человек будет считаться защищенным, только если на нем надет выбранный элемент."
+        default=ppe_classes,
+        help="Человек будет считаться в защите, только если на нем надет выбранный элемент."
     )
 
     # --- ФУНКЦИЯ ОБРАБОТКИ КАДРА ---
@@ -51,44 +83,54 @@ if model:
         if len(boxes) == 0:
             return img_cv, protected_count, unprotected_count
 
-        people = []
+        raw_people = []
         protection_boxes = []
 
-        # Распределяем найденные объекты
+        # 1. Собираем все найденные объекты
         for box in boxes:
             cls_id = int(box.cls[0])
             label = model.names[cls_id].lower()
             coords = box.xyxy[0].tolist()
+            confidence = float(box.conf[0])
             
             if label in person_classes:
-                people.append(coords)
-            elif label in target_ppe: # Учитываем только выбранные в фильтре классы
-                protection_boxes.append((coords, label))
-                # Отрисовка рамки самого СИЗ (например, каски) - синим цветом
+                raw_people.append({"coords": coords, "conf": confidence})
+            elif label in target_ppe:
+                protection_boxes.append(coords)
+                # Рисуем рамки СИЗ (голубые)
                 cv2.rectangle(img_cv, (int(coords[0]), int(coords[1])), (int(coords[2]), int(coords[3])), (255, 255, 0), 2)
                 cv2.putText(img_cv, label.upper(), (int(coords[0]), int(coords[1]-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
-        # Проверка защиты для каждого человека
-        for p in people:
-            px1, py1, px2, py2 = p
+        # 2. Фильтруем людей от дубликатов (NMS)
+        raw_people.sort(key=lambda x: x['conf'], reverse=True) # Сначала самые уверенные
+        filtered_people = []
+        
+        for person in raw_people:
+            is_duplicate = False
+            for fp in filtered_people:
+                if compute_iou(person["coords"], fp["coords"]) > 0.4: # Если рамки пересекаются на 40%
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                filtered_people.append(person)
+
+        # 3. Проверка защиты для каждого уникального человека
+        for p in filtered_people:
+            px1, py1, px2, py2 = p["coords"]
             is_protected = False
             
-            # Проверяем, пересекается ли человек с выбранными СИЗ
-            for prot_coords, prot_label in protection_boxes:
-                rx1, ry1, rx2, ry2 = prot_coords
-                # Логика пересечения прямоугольников
-                if not (rx2 < px1 or rx1 > px2 or ry2 < py1 or ry1 > py2):
+            for prot_coords in protection_boxes:
+                # Проверяем, надето ли СИЗ именно на этого человека
+                if is_ppe_on_person(p["coords"], prot_coords):
                     is_protected = True
                     break
             
             if is_protected:
                 protected_count += 1
-                # Зеленый квадрат для человека В ЗАЩИТЕ
                 cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 255, 0), 2)
                 cv2.putText(img_cv, "PROTECTED", (int(px1), int(py1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 unprotected_count += 1
-                # Красный квадрат для человека БЕЗ ЗАЩИТЫ
                 cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 2)
                 cv2.putText(img_cv, "NO PROTECTION", (int(px1), int(py1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
@@ -97,15 +139,14 @@ if model:
     # --- КЛАСС ДЛЯ REAL-TIME ВИДЕО ---
     class VideoProcessor:
         def __init__(self):
-            self.conf = 0.4
+            self.conf = 0.3
             self.target_ppe = []
 
         def recv(self, frame):
             img = frame.to_ndarray(format="bgr24")
-            # Обрабатываем кадр с использованием динамических параметров
             processed_img, p_count, u_count = process_image_logic(img, model, self.conf, self.target_ppe)
             
-            # Счетчики в левом верхнем углу видео
+            # Статистика в углу видео
             cv2.putText(processed_img, f"Protected: {p_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.putText(processed_img, f"Unprotected: {u_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             
@@ -125,7 +166,6 @@ if model:
             }
         )
         
-        # Обновление параметров для живого видео на лету
         if ctx.video_processor:
             ctx.video_processor.conf = conf_val
             ctx.video_processor.target_ppe = selected_ppe
@@ -136,12 +176,10 @@ if model:
             img = Image.open(up_img)
             img_cv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
             
-            # Обработка с учетом выбранных классов СИЗ
             res_cv, p_count, u_count = process_image_logic(img_cv, model, conf_val, selected_ppe)
             
             st.image(cv2.cvtColor(res_cv, cv2.COLOR_BGR2RGB), use_container_width=True)
             
-            # Статистика
             st.markdown("---")
             st.markdown("<h3 style='text-align: center;'>Статистика распознавания:</h3>", unsafe_allow_html=True)
             
