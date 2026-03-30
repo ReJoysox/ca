@@ -20,7 +20,6 @@ st.set_page_config(page_title="SafeGuard PRO", layout="centered")
 ROOT = Path(__file__).parent
 MODEL_PATH = ROOT / "best.onnx"
 CLASSES_PATH = ROOT / "classes.txt"
-
 IMGSZ = 640
 
 
@@ -48,8 +47,8 @@ _lock = threading.Lock()
 CFG = {
     "conf_helmet": 0.25,
     "conf_person": 0.12,
-    "helmet_inside_ratio": 0.03,  # мягкая привязка каски к человеку
-    "person_expand_up": 0.65,      # насколько расширять person вверх
+    "helmet_inside_ratio": 0.03,
+    "person_expand_up": 0.65,
 }
 
 
@@ -63,7 +62,7 @@ def cfg_get():
         return dict(CFG)
 
 
-# ================= Helpers =================
+# ================= UI helpers =================
 def indicator_html(ok: bool, text: str):
     color = "#22c55e" if ok else "#ef4444"
     return f"""
@@ -103,32 +102,29 @@ def inside_ratio(person_box, obj_box) -> float:
     return inter / (box_area(obj_box) + 1e-9)
 
 
-# ================= Load model =================
+# ================= Load classes/model =================
 @st.cache_resource
 def load_classes():
     if not CLASSES_PATH.exists():
         raise FileNotFoundError(f"classes.txt not found: {CLASSES_PATH}")
-    names = [x.strip() for x in CLASSES_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
-    return names
+    return [x.strip() for x in CLASSES_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
 
 
 @st.cache_resource
 def load_model():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"best.onnx does not exist: {MODEL_PATH}")
+    return YOLO(str(MODEL_PATH), task="detect")
 
-    model = YOLO(str(MODEL_PATH), task="detect")
 
-    # Жёстко фиксируем порядок классов по твоему classes.txt
-    names = load_classes()  # person, helmet, vest, no-helmet, no-vest
-    model.names = {i: n for i, n in enumerate(names)}
-
-    return model
+def label_from_id(cls_id: int, classes: list[str]) -> str:
+    if 0 <= cls_id < len(classes):
+        return classes[cls_id]
+    return f"class{cls_id}"
 
 
 # ================= Core logic =================
-def process_frame(img_bgr, model, conf_helmet, conf_person, helmet_inside_ratio, person_expand_up):
-    # общий conf ставим минимальный, чтобы person не отрезало
+def process_frame(img_bgr, model, classes, conf_helmet, conf_person, helmet_inside_ratio, person_expand_up):
     pred_conf = min(conf_helmet, conf_person, 0.10)
 
     res = model.predict(img_bgr, conf=pred_conf, imgsz=IMGSZ, iou=0.3, verbose=False)[0]
@@ -139,7 +135,7 @@ def process_frame(img_bgr, model, conf_helmet, conf_person, helmet_inside_ratio,
 
     for b in boxes:
         cls_id = int(b.cls[0])
-        label = model.names.get(cls_id, str(cls_id))
+        label = label_from_id(cls_id, classes)
         score = float(b.conf[0])
         xyxy = b.xyxy[0].tolist()
 
@@ -147,121 +143,3 @@ def process_frame(img_bgr, model, conf_helmet, conf_person, helmet_inside_ratio,
             persons.append(xyxy)
         elif label == "helmet" and score >= conf_helmet:
             helmets.append(xyxy)
-
-    safe = 0
-    danger = 0
-    img_h = img_bgr.shape[0]
-
-    # рисуем каски зелёным
-    for h in helmets:
-        x1, y1, x2, y2 = map(int, h)
-        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-    # рисуем людей красным/зелёным + считаем
-    for p in persons:
-        px1, py1, px2, py2 = p
-        p_exp = expand_person_up(p, img_h, person_expand_up)
-
-        has_helmet = any(inside_ratio(p_exp, h) >= helmet_inside_ratio for h in helmets)
-
-        if has_helmet:
-            safe += 1
-            cv2.rectangle(img_bgr, (int(px1), int(py1)), (int(px2), int(py2)), (0, 255, 0), 3)
-        else:
-            danger += 1
-            cv2.rectangle(img_bgr, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 3)
-
-    # общий статус (по кадру)
-    if len(persons) == 0:
-        status_ok = False
-        status_text = "ЧЕЛОВЕК НЕ ОБНАРУЖЕН"
-    else:
-        status_ok = (danger == 0 and safe > 0)
-        status_text = "ЕСТЬ СИЗ" if status_ok else "НЕТ СИЗ"
-
-    return img_bgr, safe, danger, status_ok, status_text
-
-
-# ================= UI =================
-try:
-    model = load_model()
-except Exception as e:
-    st.error(f"Ошибка загрузки модели: {e}")
-    st.stop()
-
-st.title("🛡️ SafeGuard PRO")
-
-st.sidebar.header("Настройки")
-conf_helmet = st.sidebar.slider("Порог каски (helmet)", 0.05, 1.0, 0.25, 0.05)
-conf_person = st.sidebar.slider("Порог человека (person)", 0.01, 1.0, 0.12, 0.01)
-helmet_inside_ratio = st.sidebar.slider("Привязка каски к человеку (мягкость)", 0.01, 0.30, 0.03, 0.01)
-person_expand_up = st.sidebar.slider("Расширение person вверх", 0.10, 1.20, 0.65, 0.05)
-
-cfg_set(
-    conf_helmet=conf_helmet,
-    conf_person=conf_person,
-    helmet_inside_ratio=helmet_inside_ratio,
-    person_expand_up=person_expand_up,
-)
-
-st.sidebar.write("---")
-st.sidebar.write("Классы:")
-st.sidebar.code("\n".join([f"{i}: {n}" for i, n in model.names.items()]))
-
-tab1, tab2 = st.tabs(["🎥 LIVE ВИДЕО", "📁 АНАЛИЗ ФОТО"])
-
-
-class VideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.last = {"safe": 0, "danger": 0, "ok": False, "text": "—"}
-        self._l = threading.Lock()
-
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        cfg = cfg_get()
-
-        out, safe, danger, ok, text = process_frame(
-            img,
-            model,
-            cfg["conf_helmet"],
-            cfg["conf_person"],
-            cfg["helmet_inside_ratio"],
-            cfg["person_expand_up"],
-        )
-
-        with self._l:
-            self.last = {"safe": safe, "danger": danger, "ok": ok, "text": text}
-
-        return av.VideoFrame.from_ndarray(out, format="bgr24")
-
-
-with tab1:
-    st.write("Если камера не стартует на Streamlit Cloud — это ограничения WebRTC/сети. TURN уже подключен.")
-    ctx = webrtc_streamer(
-        key="ppe-live",
-        video_processor_factory=VideoProcessor,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": {"width": 640, "height": 480, "frameRate": 12}, "audio": False},
-        async_processing=True,
-    )
-
-    # Индикатор под видео (обновится при каждом перезапуске скрипта/движении слайдеров)
-    if ctx.video_processor:
-        with ctx.video_processor._l:
-            info = dict(ctx.video_processor.last)
-        st.markdown(indicator_html(info["ok"], info["text"]), unsafe_allow_html=True)
-        st.write(f"SAFE: {info['safe']} | DANGER: {info['danger']}")
-    else:
-        st.markdown(indicator_html(False, "LIVE не запущен"), unsafe_allow_html=True)
-
-with tab2:
-    up_img = st.file_uploader("Загрузите фото", type=["jpg", "jpeg", "png"])
-    if up_img:
-        img_bgr = cv2.cvtColor(np.array(Image.open(up_img).convert("RGB")), cv2.COLOR_RGB2BGR)
-        out, safe, danger, ok, text = process_frame(
-            img_bgr, model, conf_helmet, conf_person, helmet_inside_ratio, person_expand_up
-        )
-        st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-        st.markdown(indicator_html(ok, text), unsafe_allow_html=True)
-        st.write(f"SAFE: {safe} | DANGER: {danger}")
