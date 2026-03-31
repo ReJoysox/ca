@@ -122,7 +122,7 @@ if model:
             if is_protected:
                 protected_count += 1
                 cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 255, 0), 3)
-                cv2.putText(img_cv, "HELMET DETECTED", (int(px1), int(py1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(img_cv, "", (int(px1), int(py1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             else:
                 unprotected_count += 1
                 cv2.rectangle(img_cv, (int(px1), int(py1)), (int(px2), int(py2)), (0, 0, 255), 3)
