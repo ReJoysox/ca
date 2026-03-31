@@ -65,7 +65,7 @@ if model:
         default_helmets = ppe_classes
 
     # Боковое меню
-    st.sidebar.write("### ⚙️ Тонкая настройка ИИ")
+    st.sidebar.write("### ⚙️ Настройка ИИ")
     
     # Снижен порог чувствительности по умолчанию до 0.25 (чтобы ИИ не стеснялся выдавать неуверенные каски)
     conf_val = st.sidebar.slider("Чувствительность (Conf)", 0.05, 1.0, 0.25, 0.05, 
@@ -131,7 +131,7 @@ if model:
         return img_cv, protected_count, unprotected_count
 
     # --- ИНТЕРФЕЙС ---
-    st.write("### 📁 Загрузите фото (Анализ повышенной точности)")
+    st.write("### 📁 Загрузите фото ")
     
     up_img = st.file_uploader("", type=['jpg', 'png', 'jpeg'])
     
